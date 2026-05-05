@@ -24,8 +24,13 @@ ENV/
 secrets/
 *.pem
 *.key
-tokens.json
+.tokens.json
+.session_state.json
 credentials.json
+
+# Browser profile saved by Playwright (contains session cookies)
+.browser_profile/
+playwright/.auth/
 
 # Database / state
 *.db

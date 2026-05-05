@@ -7,8 +7,13 @@ Run modes:
   python -m onq_autopilot.pipeline --once    # process all pending assignments now
   python -m onq_autopilot.pipeline --watch   # poll every POLL_INTERVAL_SECONDS
 
-State tracking: a simple JSON file (state/seen.json) records which
-folder IDs have already been processed so we don't re-do them.
+Auth strategy:
+  Session cookies from Playwright browser login (see session.py).
+  No OAuth registration required — we piggyback on the real browser session.
+
+State tracking:
+  state/seen.json records processed {orgUnitId}:{folderId} pairs.
+  Delete entries to re-process.
 """
 
 import json
@@ -22,8 +27,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from . import d2l_client as d2l
-from .extractor import build_assignment_bundle
+from .extractor import build_assignment_bundle, html_to_text
 from .llm import complete
+from .scraper import scrape_assignment_page
 
 OUTPUT_DIR     = Path(os.getenv("OUTPUT_DIR", "outputs"))
 STATE_DIR      = Path("state")
@@ -76,8 +82,27 @@ def process_assignment(course: dict, folder: dict):
         d2l.download_folder_attachment(org_unit_id, folder_id, file_id, str(save_path))
         attachment_paths.append(str(save_path))
 
+    # Enrich instructions via scraper (API sometimes returns stripped HTML)
+    print("  [🔍] Scraping assignment page for full instructions...")
+    scraped = {}
+    try:
+        scraped = scrape_assignment_page(org_unit_id, folder_id)
+        if scraped.get("instructions_text") and len(scraped["instructions_text"]) > len(
+            html_to_text(str(folder.get("CustomInstructions", "")))
+        ):
+            # Patch folder with richer instructions from scraper
+            folder["CustomInstructions"] = {
+                "Html": scraped["instructions_html"],
+                "Text": scraped["instructions_text"],
+            }
+            print("  [✓] Used scraped instructions (richer than API)")
+    except Exception as e:
+        print(f"  [!] Scraper skipped ({e}) — using API data")
+
     # Build the structured bundle
     bundle = build_assignment_bundle(course, folder, attachment_paths)
+    if scraped.get("external_links"):
+        bundle["external_links"] = scraped["external_links"]
 
     # Call the LLM
     print(f"  [🤖] Sending to LLM ({os.getenv('LLM_PROVIDER', 'openai')})...")

@@ -3,37 +3,52 @@ onq_autopilot/d2l_client.py
 ────────────────────────────
 Thin wrapper around the D2L Valence REST API.
 
-API version used: 1.82 (LMS v20.25.1+)
-Reference: https://docs.valence.desire2learn.com/res/dropbox.html
+Authentication: browser session cookies via session.get_requests_session()
+API version:    1.82  (LMS v20.25.1+)
+Reference:      https://docs.valence.desire2learn.com/res/dropbox.html
 
-All methods return parsed Python dicts/lists. Caller should handle errors.
+No OAuth tokens needed — we piggyback on the real browser session.
 """
 
 import os
-import requests
-from .auth import get_valid_tokens
+from pathlib import Path
+from .session import get_requests_session
 
 BASE_URL    = os.getenv("ONQ_BASE_URL", "https://onq.queensu.ca")
 API_VERSION = "1.82"
 
 
-def _headers() -> dict:
-    tokens = get_valid_tokens()
-    return {"Authorization": f"Bearer {tokens['access_token']}"}
-
-
-def _get(path: str, **kwargs) -> dict | list:
+def _get(path: str, **kwargs):
+    s = get_requests_session()
     url = f"{BASE_URL}/d2l/api/{path}"
-    resp = requests.get(url, headers=_headers(), **kwargs)
+    resp = s.get(url, **kwargs)
     resp.raise_for_status()
     return resp.json()
 
 
-def _post(path: str, **kwargs) -> dict | list:
+def _post(path: str, **kwargs):
+    s = get_requests_session()
     url = f"{BASE_URL}/d2l/api/{path}"
-    resp = requests.post(url, headers=_headers(), **kwargs)
+    # D2L requires the CSRF token for state-mutating calls
+    csrf = _get_csrf_token(s)
+    s.headers["X-Csrf-Token"] = csrf
+    resp = s.post(url, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+def _get_csrf_token(session) -> str:
+    """
+    D2L embeds a CSRF token in the page that is required for POST calls.
+    We retrieve it from the /d2l/lp/auth/xsrf-tokens endpoint.
+    """
+    resp = session.get(f"{BASE_URL}/d2l/lp/auth/xsrf-tokens", timeout=10)
+    if resp.status_code == 200:
+        try:
+            return resp.json().get("ReferrerToken", "")
+        except Exception:
+            pass
+    return ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,10 +64,6 @@ def get_my_user_id() -> int:
 def get_my_enrollments() -> list[dict]:
     """
     Returns all org units (courses) the current user is enrolled in.
-
-    Schema per item:
-      OrgUnit.{Id, Name, Type, Code}
-      Access.{IsActive, StartDate, EndDate, CanAccess}
     """
     data = _get(f"lp/{API_VERSION}/enrollments/myenrollments/")
     return data.get("Items", [])
@@ -74,10 +85,6 @@ def get_active_courses() -> list[dict]:
 def get_dropbox_folders(org_unit_id: int) -> list[dict]:
     """
     Returns all assignment (dropbox) folders for a given course.
-
-    Each folder contains:
-      Id, Name, CustomInstructions (HTML), DueDate, Attachments[],
-      SubmissionType, Assessment.ScoreDenominator, ...
     """
     return _get(f"le/{API_VERSION}/{org_unit_id}/dropbox/folders/")
 
@@ -90,24 +97,30 @@ def get_dropbox_folder(org_unit_id: int, folder_id: int) -> dict:
 def get_my_submissions(org_unit_id: int, folder_id: int) -> list[dict]:
     """Returns the current user's submissions to a specific dropbox folder."""
     return _get(
-        f"le/{API_VERSION}/{org_unit_id}/dropbox/folders/{folder_id}/submissions/mysubmissions/"
+        f"le/{API_VERSION}/{org_unit_id}/dropbox/folders/{folder_id}"
+        f"/submissions/mysubmissions/"
     )
 
 
 def download_folder_attachment(
-    org_unit_id: int, folder_id: int, file_id: int, save_path: str
-):
+    org_unit_id: int,
+    folder_id: int,
+    file_id: int,
+    save_path: str,
+) -> str:
     """
-    Downloads a *folder-level* file attachment (i.e., the assignment brief PDF).
-    These are files attached by the instructor to the dropbox folder itself.
+    Downloads a folder-level file attachment (assignment brief / rubric PDF).
+    Returns the local save path.
     """
+    s = get_requests_session()
     url = (
         f"{BASE_URL}/d2l/api/le/{API_VERSION}"
         f"/{org_unit_id}/dropbox/folders/{folder_id}/attachments/{file_id}"
     )
-    resp = requests.get(url, headers=_headers(), stream=True)
+    resp = s.get(url, stream=True, timeout=60)
     resp.raise_for_status()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
@@ -121,19 +134,18 @@ def submit_text_submission(
     comment: str = "",
 ) -> dict:
     """
-    Submits a text-type response to a dropbox folder.
-    Only works if the folder's SubmissionType is Text (1) or File or Text (4).
-
-    NOTE: AUTO_SUBMIT must be explicitly enabled in .env.
+    Submits a text response to a dropbox folder.
+    Only works if SubmissionType is Text (1) or File or Text (4).
+    Guarded by AUTO_SUBMIT env var.
     """
     if os.getenv("AUTO_SUBMIT", "false").lower() != "true":
         raise PermissionError(
-            "AUTO_SUBMIT is disabled. Review the LLM output and set "
+            "AUTO_SUBMIT is disabled. Review outputs and set "
             "AUTO_SUBMIT=true in .env to enable automatic submission."
         )
     payload = {
         "TextSubmission": {"Html": text_html, "Text": ""},
-        "Comment":        {"Html": comment, "Text": comment},
+        "Comment":        {"Html": comment,   "Text": comment},
     }
     return _post(
         f"le/{API_VERSION}/{org_unit_id}/dropbox/folders/{folder_id}/submissions/",

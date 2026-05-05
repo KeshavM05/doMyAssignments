@@ -73,31 +73,45 @@ POST answer back to D2L dropbox
 ## 2. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        pipeline.py (orchestrator)               │
-│  scan_once() / watch()                                          │
-│    ├─► d2l_client.get_active_courses()                          │
-│    ├─► d2l_client.get_dropbox_folders(org_unit_id)              │
-│    ├─► d2l_client.download_folder_attachment(...)               │
-│    ├─► extractor.build_assignment_bundle(course, folder, files) │
-│    ├─► llm.complete(bundle)                                     │
-│    └─► d2l_client.submit_text_submission(...)  [if enabled]     │
-└─────────────────────────────────────────────────────────────────┘
-         │                │               │
-    auth.py          d2l_client.py    extractor.py      llm.py
-  OAuth2 flow       Valence API      File parsing    LLM routing
-  Token refresh     wrappers         HTML→text       Prompt build
+┌──────────────────────────────────────────────────────────────────┐
+│                     pipeline.py (orchestrator)                   │
+│  scan_once() / watch()                                           │
+│    ├─► d2l_client.get_active_courses()   ← REST API + cookies    │
+│    ├─► d2l_client.get_dropbox_folders()  ← REST API + cookies    │
+│    ├─► d2l_client.download_folder_attachment()                   │
+│    ├─► scraper.scrape_assignment_page()  ← Playwright HTML       │
+│    ├─► extractor.build_assignment_bundle()                       │
+│    ├─► llm.complete(bundle)                                      │
+│    └─► d2l_client.submit_text_submission()  [if enabled]         │
+│         OR scraper.submit_via_browser()     [fallback]           │
+└──────────────────────────────────────────────────────────────────┘
+         │                │               │               │
+   session.py       d2l_client.py    scraper.py     extractor.py
+  Playwright SSO    Valence REST     Playwright      File parsing
+  Cookie persist    API wrappers     HTML scraper    Prompt build
 ```
 
-### Data flow types
+### Why cookies instead of OAuth?
+
+D2L Brightspace accepts the **same browser session cookies** for REST API calls
+that it sets when you log in through the web interface. This means:
+
+- ✅ No OAuth app registration with IT
+- ✅ No API keys from the institution  
+- ✅ Uses your real student account
+- ✅ Accesses exactly what you can see in the browser
+- ⚠️  Sessions expire (~8–20h), requiring a re-login
+
+### Data flow
 
 | Object | Source | Purpose |
 |--------|--------|---------|
-| `Enrollment` | `GET /lp/{v}/enrollments/myenrollments/` | List of courses |
-| `DropboxFolder` | `GET /le/{v}/{orgId}/dropbox/folders/` | Assignment metadata |
-| `File` (binary) | `GET /le/{v}/{orgId}/dropbox/folders/{fId}/attachments/{fileId}` | Instructor PDFs |
+| Browser cookies | Playwright (one-time login) | Authenticate all API + scrape calls |
+| `Enrollment` | REST API `/lp/{v}/enrollments/myenrollments/` | List of courses |
+| `DropboxFolder` | REST API `/le/{v}/{orgId}/dropbox/folders/` | Assignment metadata |
+| Scraped HTML | Playwright `/d2l/lms/dropbox/user/folder_submit_files.d2l` | Richer instructions |
+| File (binary) | REST API `.../attachments/{fileId}` | Instructor PDFs |
 | `AssignmentBundle` | Built by `extractor.py` | Sent to LLM |
-| `EntityDropbox` | `GET .../submissions/mysubmissions/` | Check prior submissions |
 
 ---
 
@@ -106,14 +120,15 @@ POST answer back to D2L dropbox
 ```
 d2l/
 ├── .gitignore
-├── .env.example          ← Copy to .env and fill in secrets
-├── pyproject.toml        ← Dependencies and build config
+├── .env.example          ← Copy to .env and fill in
+├── pyproject.toml        ← Dependencies (includes playwright)
 ├── README.md             ← This file
 │
 ├── onq_autopilot/
 │   ├── __init__.py
-│   ├── auth.py           ← OAuth2 flow, token storage, refresh
-│   ├── d2l_client.py     ← Valence REST API wrappers
+│   ├── session.py        ← Playwright SSO login, cookie persistence
+│   ├── d2l_client.py     ← Valence REST API wrappers (cookie-authed)
+│   ├── scraper.py        ← Playwright HTML scraper + browser submitter
 │   ├── extractor.py      ← File parsing, AssignmentBundle builder
 │   ├── llm.py            ← LLM provider dispatch, prompt builder
 │   └── pipeline.py       ← Main orchestration loop (CLI entry-point)
@@ -122,15 +137,16 @@ d2l/
 │   └── test_extractor.py ← Unit tests (no network)
 │
 ├── state/
-│   └── seen.json         ← Tracks processed assignment IDs (auto-created)
+│   └── seen.json         ← Processed assignment IDs (auto-created)
 │
-├── outputs/              ← LLM answers saved here (auto-created, gitignored)
-│   └── {org_unit_id}/
-│       └── {folder_id}/
-│           ├── attachments/   ← Downloaded instructor files
-│           └── answer_TIMESTAMP.md
+├── .session_state.json   ← Browser cookies (auto-created, gitignored!)
+├── .browser_profile/     ← Chromium profile dir (gitignored!)
 │
-└── downloads/            ← Scratch download space (gitignored)
+└── outputs/              ← LLM answers (auto-created, gitignored)
+    └── {org_unit_id}/
+        └── {folder_id}/
+            ├── attachments/
+            └── answer_TIMESTAMP.md
 ```
 
 ---
@@ -145,84 +161,67 @@ d2l/
 |------|---------|
 | **Org Unit** | A course section. Has a numeric `Id`. |
 | **Dropbox Folder** | An assignment submission slot. Identified by `Id`. |
-| **Entity** | A user or group that can submit to a folder. |
 | **SubmissionType** | `0=File, 1=Text, 2=OnPaper, 3=Observed, 4=File or Text` |
-| **Scope** | OAuth permission string, e.g. `dropbox:folders:read` |
 
 ### Endpoints used
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/d2l/api/lp/1.82/users/whoami` | Get current user ID |
+| GET | `/d2l/api/lp/1.82/users/whoami` | Verify session / get user ID |
 | GET | `/d2l/api/lp/1.82/enrollments/myenrollments/` | List all courses |
 | GET | `/d2l/api/le/1.82/{orgId}/dropbox/folders/` | List assignments |
-| GET | `/d2l/api/le/1.82/{orgId}/dropbox/folders/{fId}` | Single assignment details |
 | GET | `/d2l/api/le/1.82/{orgId}/dropbox/folders/{fId}/attachments/{fileId}` | Download instructor file |
 | GET | `/d2l/api/le/1.82/{orgId}/dropbox/folders/{fId}/submissions/mysubmissions/` | Check prior submissions |
-| POST | `/d2l/api/le/1.82/{orgId}/dropbox/folders/{fId}/submissions/` | Submit an answer |
-
-### Rate limits
-
-The API enforces a rate limit. Responses may return `429 Too Many Requests`.
-The pipeline does **not** currently implement exponential back-off — add it if
-you run into 429s during large scans.
+| POST | `/d2l/api/le/1.82/{orgId}/dropbox/folders/{fId}/submissions/` | Submit text answer |
+| GET | `/d2l/lp/auth/xsrf-tokens` | Get CSRF token for POST calls |
 
 ---
 
-## 5. Authentication Setup (Critical — Read First)
+## 5. Authentication — How the Cookie Approach Works
 
-### Why this is hard
-
-Queen's runs Brightspace on their own servers. Unlike a personal D2L instance,
-**you cannot register an OAuth app in the OnQ admin panel yourself** — only
-system administrators can. There are two practical paths:
-
-#### Path A — Contact Queen's IT / ITS (Recommended for longevity)
-
-1. Email `itservicedesk@queensu.ca` and ask to register a personal developer
-   OAuth 2.0 application in OnQ for research/automation purposes.
-2. Specify: **Authorization Code Grant**, scopes listed below, redirect URI
-   `http://localhost:8080/callback`.
-3. They will give you a **Client ID** and **Client Secret**.
-
-#### Path B — Session Cookie / Browser Token (Quick & dirty)
-
-If IT won't cooperate, you can extract your active session bearer token from
-the browser's DevTools (Network tab) and paste it directly into `.tokens.json`
-as a temporary measure. It expires in ~20 hours.
-
-```json
-{
-  "access_token": "eyJ0eX...",
-  "expires_at": 9999999999,
-  "token_type": "Bearer"
-}
-```
-
-> ⚠️  This is a hack. There is no refresh token, so you'd need to re-paste
-> every session. Only use this for testing.
-
-### Required OAuth Scopes
-
-When registering (Path A), request these scopes:
+### First run (visible browser)
 
 ```
-core:*:*
-enrollment:orgunit:read
-dropbox:folders:read
-dropbox:folders:write
-dropbox:submission:read
-dropbox:submission:write
-content:modules:read
-content:topics:read
+You                    Playwright              OnQ / Microsoft SSO
+ │                         │                          │
+ │    python --once         │                          │
+ │─────────────────────────►│                          │
+ │                          │── opens Chromium ──────►│
+ │                          │◄── Microsoft login page ─│
+ │◄── browser window ───────│                          │
+ │── enter NetID + password ──────────────────────────►│
+ │── complete MFA ─────────────────────────────────────►│
+ │                          │◄── redirect to OnQ ──────│
+ │                          │── save cookies ──────────│
+ │                          │   to .session_state.json │
+ │◄── browser closes ───────│                          │
+ │                          │── continues pipeline ────│
 ```
 
-### Token storage
+### Subsequent runs (headless)
 
-Tokens are saved to `.tokens.json` (gitignored). The `auth.py` module:
-- Loads tokens from disk on every run
-- Auto-refreshes using the refresh token if the access token is expired
-- Re-runs the full browser OAuth flow if no refresh token is available
+```
+pipeline.py → session.get_requests_session()
+           → loads .session_state.json
+           → hits /whoami → 200 OK → session still valid
+           → all API calls use cookie session
+           → no browser opens
+```
+
+### Session expiry
+
+If the session expires (~8–20h depending on OnQ config), the next run will:
+1. Detect the 401 on `/whoami`
+2. Open the browser again for you to re-login
+3. Save fresh cookies
+4. Continue
+
+### MFA handling
+
+- The visible browser is a **real Chromium** with a persistent profile (`.browser_profile/`)
+- After the first login + MFA, Microsoft sets a "remember this device" cookie in the profile
+- Subsequent re-logins (for expired sessions) often skip MFA entirely
+- You do NOT need TOTP codes or anything programmatic
 
 ---
 

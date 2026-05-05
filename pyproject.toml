@@ -7,6 +7,8 @@ requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
     "python-dotenv>=1.0",
+    # Browser automation (SSO login + scraping)
+    "playwright>=1.44",
     # LLM providers (install whichever you use)
     "openai>=1.30",
     "anthropic>=0.28",
