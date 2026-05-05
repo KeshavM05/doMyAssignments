@@ -1,0 +1,32 @@
+[project]
+name = "onq-autopilot"
+version = "0.1.0"
+description = "Automated D2L/OnQ assignment fetcher and LLM completion pipeline"
+requires-python = ">=3.11"
+
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    # LLM providers (install whichever you use)
+    "openai>=1.30",
+    "anthropic>=0.28",
+    "google-generativeai>=0.7",
+    # File extraction
+    "pdfplumber>=0.10",
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-mock>=3.14",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

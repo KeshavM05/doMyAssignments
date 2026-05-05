@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Environments
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets & credentials (NEVER commit these)
+secrets/
+*.pem
+*.key
+tokens.json
+credentials.json
+
+# Database / state
+*.db
+*.sqlite3
+state/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Downloaded assignment files (user data, not source)
+downloads/
+outputs/
