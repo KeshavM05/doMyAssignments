@@ -4,16 +4,23 @@ onq_autopilot/pipeline.py
 Core orchestration loop.
 
 Run modes:
-  python -m onq_autopilot.pipeline --once    # process all pending assignments now
+  python -m onq_autopilot.pipeline --once    # scan all courses once
   python -m onq_autopilot.pipeline --watch   # poll every POLL_INTERVAL_SECONDS
 
-Auth strategy:
-  Session cookies from Playwright browser login (see session.py).
-  No OAuth registration required — we piggyback on the real browser session.
+Workflow per assignment:
+  1. Scrape Assessments tab  →  list of upcoming assignments
+  2. Scrape Contents tab     →  full topic tree (via API, falls back to browser)
+  3. Match assignment name   →  find the most relevant content PDF/DOCX
+  4. Download matched files  →  save to outputs/<ou>/<folder>/attachments/
+  5. Extract text            →  from PDFs, DOCX, and assignment instructions
+  6. Build AssignmentBundle  →  structured dict passed to LLM
+  7. LLM call                →  returns LaTeX body
+  8. latex_output.py         →  wraps in document, saves .tex, compiles .pdf
+  9. Mark seen               →  state/seen.json records processed IDs
 
-State tracking:
-  state/seen.json records processed {orgUnitId}:{folderId} pairs.
-  Delete entries to re-process.
+No submission. No AUTO_SUBMIT. Output stays on your laptop.
+
+State tracking: state/seen.json  —  delete an entry to re-process.
 """
 
 import json
@@ -21,22 +28,28 @@ import os
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from . import d2l_client as d2l
-from .extractor import build_assignment_bundle, html_to_text
+from .scraper import (
+    scrape_assignments_list,
+    scrape_course_content_via_api,
+    find_content_for_assignment,
+    download_topic_file,
+)
+from .extractor import build_assignment_bundle, extract_text_from_file
 from .llm import complete
-from .scraper import scrape_assignment_page
+from .latex_output import generate_output
 
-OUTPUT_DIR     = Path(os.getenv("OUTPUT_DIR", "outputs"))
-STATE_DIR      = Path("state")
-SEEN_FILE      = STATE_DIR / "seen.json"
-SKIP_TYPES     = {t.strip().lower() for t in os.getenv("SKIP_TYPES", "quiz,exam").split(",")}
-POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-AUTO_SUBMIT    = os.getenv("AUTO_SUBMIT", "false").lower() == "true"
+OUTPUT_DIR    = Path(os.getenv("OUTPUT_DIR", "outputs"))
+STATE_DIR     = Path("state")
+SEEN_FILE     = STATE_DIR / "seen.json"
+SKIP_KEYWORDS = {t.strip().lower() for t in os.getenv("SKIP_TYPES", "quiz,exam,midterm,final").split(",")}
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
+MAX_CONTENT_DOCS = int(os.getenv("MAX_CONTENT_DOCS", "2"))  # cap content docs sent to LLM
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,152 +73,210 @@ def mark_seen(key: str):
 # Per-assignment processing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def process_assignment(course: dict, folder: dict):
+def process_assignment(course: dict, assignment: dict) -> dict:
+    """
+    Full pipeline for a single assignment.
+
+    Args:
+        course:     OrgUnit enrollment dict from d2l_client
+        assignment: Assignment dict from scrape_assignments_list()
+
+    Returns result dict with tex_path, pdf_path, bundle keys.
+    """
     org_unit_id = course["OrgUnit"]["Id"]
-    folder_id   = folder["Id"]
+    folder_id   = assignment["folder_id"]
     key         = f"{org_unit_id}:{folder_id}"
 
-    print(f"\n{'='*60}")
-    print(f"  Course  : {course['OrgUnit']['Name']}")
-    print(f"  Assignment: {folder['Name']}")
-    print(f"  Due     : {folder.get('DueDate', 'N/A')}")
-    print(f"  Type    : {folder.get('SubmissionType')}")
-    print(f"{'='*60}")
+    print(f"\n{'='*62}")
+    print(f"  Course     : {course['OrgUnit']['Name']}")
+    print(f"  Assignment : {assignment['name']}")
+    print(f"  Due        : {assignment.get('due_date', 'N/A')}")
+    print(f"{'='*62}")
 
-    # Download instructor-attached files (the brief / rubric PDFs)
+    # ── Step 1: Get API folder metadata (for attachments + score) ────────────
+    folder_meta = {}
+    try:
+        folder_meta = d2l.get_dropbox_folder(org_unit_id, folder_id)
+    except Exception as e:
+        print(f"  [!] Could not fetch folder metadata via API ({e}) — using scraped data")
+
+    # ── Step 2: Download instructor-attached files from the dropbox ──────────
     attachment_paths = []
-    for att in folder.get("Attachments", []):
+    for att in folder_meta.get("Attachments", []):
         file_id   = att["FileId"]
         file_name = att["FileName"]
-        save_path = OUTPUT_DIR / str(org_unit_id) / str(folder_id) / "attachments" / file_name
-        print(f"  [↓] Downloading attachment: {file_name}")
-        d2l.download_folder_attachment(org_unit_id, folder_id, file_id, str(save_path))
-        attachment_paths.append(str(save_path))
-
-    # Enrich instructions via scraper (API sometimes returns stripped HTML)
-    print("  [🔍] Scraping assignment page for full instructions...")
-    scraped = {}
-    try:
-        scraped = scrape_assignment_page(org_unit_id, folder_id)
-        if scraped.get("instructions_text") and len(scraped["instructions_text"]) > len(
-            html_to_text(str(folder.get("CustomInstructions", "")))
-        ):
-            # Patch folder with richer instructions from scraper
-            folder["CustomInstructions"] = {
-                "Html": scraped["instructions_html"],
-                "Text": scraped["instructions_text"],
-            }
-            print("  [✓] Used scraped instructions (richer than API)")
-    except Exception as e:
-        print(f"  [!] Scraper skipped ({e}) — using API data")
-
-    # Build the structured bundle
-    bundle = build_assignment_bundle(course, folder, attachment_paths)
-    if scraped.get("external_links"):
-        bundle["external_links"] = scraped["external_links"]
-
-    # Call the LLM
-    print(f"  [🤖] Sending to LLM ({os.getenv('LLM_PROVIDER', 'openai')})...")
-    answer = complete(bundle)
-
-    # Save the answer locally
-    out_dir = OUTPUT_DIR / str(org_unit_id) / str(folder_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file  = out_dir / f"answer_{timestamp}.md"
-    out_file.write_text(answer, encoding="utf-8")
-    print(f"  [✓] Answer saved → {out_file}")
-
-    # Optionally auto-submit
-    if AUTO_SUBMIT:
-        sub_type = str(folder.get("SubmissionType", "0"))
-        if sub_type in ("1", "4"):  # Text or File-or-Text
-            print("  [→] Auto-submitting...")
-            d2l.submit_text_submission(
-                org_unit_id, folder_id,
-                text_html=f"<p>{answer.replace(chr(10), '<br>')}</p>",
-                comment="Submitted via ONQ Autopilot",
+        save_path = (
+            OUTPUT_DIR / str(org_unit_id) / str(folder_id)
+            / "attachments" / file_name
+        )
+        print(f"  [↓] Downloading dropbox attachment: {file_name}")
+        try:
+            d2l.download_folder_attachment(
+                org_unit_id, folder_id, file_id, str(save_path)
             )
-            print("  [✓] Submitted!")
+            attachment_paths.append(str(save_path))
+        except Exception as e:
+            print(f"      Failed: {e}")
+
+    # ── Step 3: Search course content for matching documents ─────────────────
+    print("  [🔍] Scanning course content for related documents...")
+    content_doc_paths = []
+    try:
+        topics = scrape_course_content_via_api(org_unit_id)
+        print(f"      Found {len(topics)} content topics.")
+
+        matches = find_content_for_assignment(assignment["name"], topics)
+        if matches:
+            print(f"      {len(matches)} matching topic(s) found:")
+            for m in matches[:MAX_CONTENT_DOCS]:
+                print(f"        [{m['score']:.2f}] {m['title']} ({m['type']})")
         else:
-            print("  [!] AUTO_SUBMIT=true but submission type is not Text — skipping auto-submit.")
-    else:
-        print("  [i] AUTO_SUBMIT=false — review output and submit manually.")
+            print("      No strongly matching content topics found.")
+
+        # Download top matches
+        for topic in matches[:MAX_CONTENT_DOCS]:
+            if topic.get("topic_id") is None:
+                continue
+            ext      = Path(str(topic.get("url", ""))).suffix or ".pdf"
+            filename = f"content_{topic['topic_id']}{ext}"
+            save_path = (
+                OUTPUT_DIR / str(org_unit_id) / str(folder_id)
+                / "content" / filename
+            )
+            result = download_topic_file(
+                org_unit_id, topic["topic_id"], str(save_path)
+            )
+            if result:
+                content_doc_paths.append({
+                    "name": topic["title"],
+                    "path": result,
+                })
+    except Exception as e:
+        print(f"  [!] Content scan failed ({e})")
+
+    # ── Step 4: Build AssignmentBundle ───────────────────────────────────────
+    # Merge scraped instructions with API metadata
+    if assignment.get("instructions") and folder_meta:
+        folder_meta["CustomInstructions"] = {
+            "Html": "",
+            "Text": assignment["instructions"],
+        }
+
+    bundle = build_assignment_bundle(course, folder_meta or {
+        "Id":               folder_id,
+        "Name":             assignment["name"],
+        "DueDate":          assignment.get("due_date"),
+        "CustomInstructions": {"Html": "", "Text": assignment.get("instructions", "")},
+        "Assessment":       None,
+        "SubmissionType":   "0",
+        "TotalUsersWithSubmissions": 0,
+        "Attachments":      [],
+    }, attachment_paths)
+
+    # Attach content doc texts to the bundle
+    bundle["org_unit_id"] = org_unit_id
+    bundle["folder_id"]   = folder_id
+    bundle["content_docs"] = []
+    for doc in content_doc_paths:
+        text = extract_text_from_file(doc["path"])
+        bundle["content_docs"].append({"name": doc["name"], "text": text})
+
+    # ── Step 5: LLM call ─────────────────────────────────────────────────────
+    provider = os.getenv("LLM_PROVIDER", "openai")
+    print(f"  [🤖] Sending to {provider}...")
+    latex_body = complete(bundle)
+
+    # ── Step 6: LaTeX → PDF ──────────────────────────────────────────────────
+    print("  [📄] Generating LaTeX and compiling PDF...")
+    result = generate_output(latex_body, bundle)
+
+    print(f"  [✓] Done.")
+    if result["pdf_path"]:
+        print(f"       PDF  → {result['pdf_path']}")
+    print(f"       TeX  → {result['tex_path']}")
 
     mark_seen(key)
+    return {**result, "bundle": bundle}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main scan loop
+# Scan loop
 # ──────────────────────────────────────────────────────────────────────────────
 
 def scan_once():
-    """Scan all active courses for new, unprocessed assignments."""
     seen = load_seen()
     print(f"\n[SCAN] {datetime.now().strftime('%H:%M:%S')} — Fetching active courses...")
 
-    courses = d2l.get_active_courses()
-    print(f"[SCAN] Found {len(courses)} active courses.")
+    try:
+        courses = d2l.get_active_courses()
+    except Exception as e:
+        print(f"[SCAN] Could not fetch courses via API ({e}).")
+        print("       Make sure your session is valid — run python debug.py")
+        return
+
+    print(f"[SCAN] {len(courses)} active course(s).")
 
     for course in courses:
-        org_unit_id = course["OrgUnit"]["Id"]
+        org_unit_id   = course["OrgUnit"]["Id"]
+        course_name   = course["OrgUnit"]["Name"]
+
+        print(f"\n[COURSE] {course_name} (ou={org_unit_id})")
+
+        # Get assignments from the Assessments tab via scraper
         try:
-            folders = d2l.get_dropbox_folders(org_unit_id)
+            assignments = scrape_assignments_list(org_unit_id)
+            print(f"  Found {len(assignments)} assignment(s) on Assessments tab.")
         except Exception as e:
-            print(f"  [!] Could not fetch folders for {course['OrgUnit']['Name']}: {e}")
+            print(f"  [!] Could not scrape assignments: {e}")
             continue
 
-        for folder in folders:
-            folder_id = folder["Id"]
+        for assignment in assignments:
+            folder_id = assignment["folder_id"]
             key       = f"{org_unit_id}:{folder_id}"
 
-            # Skip if already processed
+            # Already processed
             if key in seen:
                 continue
 
-            # Skip assignment types that are excluded
-            folder_name_lower = folder["Name"].lower()
-            if any(skip in folder_name_lower for skip in SKIP_TYPES):
-                print(f"  [SKIP] {folder['Name']} (matched skip list)")
+            # Skip by keyword
+            name_lower = assignment["name"].lower()
+            if any(kw in name_lower for kw in SKIP_KEYWORDS):
+                print(f"  [SKIP] {assignment['name']} (matched skip list)")
                 mark_seen(key)
                 continue
 
-            # Skip if due date has already passed
-            due = folder.get("DueDate")
-            if due:
-                from datetime import timezone
-                due_dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
-                if due_dt < datetime.now(tz=timezone.utc):
-                    print(f"  [SKIP] {folder['Name']} (past due)")
-                    mark_seen(key)
-                    continue
+            # Skip past-due assignments
+            raw_due = assignment.get("due_date", "")
+            # (due_date from scraper is a display string, not ISO — skip date check
+            #  unless it's parseable)
 
             try:
-                process_assignment(course, folder)
+                process_assignment(course, assignment)
             except Exception as e:
-                print(f"  [ERROR] Failed to process {folder['Name']}: {e}")
+                import traceback
+                print(f"  [ERROR] {assignment['name']}: {e}")
+                traceback.print_exc()
 
 
 def watch():
-    """Continuously poll for new assignments."""
-    print(f"[WATCH] Polling every {POLL_INTERVAL}s. Press Ctrl+C to stop.")
+    print(f"[WATCH] Polling every {POLL_INTERVAL}s. Ctrl+C to stop.")
     while True:
         try:
             scan_once()
         except Exception as e:
             print(f"[ERROR] Scan failed: {e}")
-        print(f"[WATCH] Sleeping {POLL_INTERVAL}s...")
+        print(f"\n[WATCH] Sleeping {POLL_INTERVAL}s...")
         time.sleep(POLL_INTERVAL)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI entry-point
+# CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ONQ Autopilot — LLM Assignment Pipeline")
+    parser = argparse.ArgumentParser(description="ONQ Autopilot")
     group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--once",  action="store_true", help="Run one scan then exit")
+    group.add_argument("--once",  action="store_true", help="Scan once and exit")
     group.add_argument("--watch", action="store_true", help="Poll continuously")
     args = parser.parse_args()
 

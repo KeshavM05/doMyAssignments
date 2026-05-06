@@ -1,227 +1,401 @@
 """
 onq_autopilot/scraper.py
 ─────────────────────────
-Playwright-based HTML scraper for OnQ pages.
+Playwright-based scraper for OnQ Brightspace.
 
-Used as a FALLBACK when the D2L REST API doesn't expose what we need —
-for example, when an assignment's instructions are only rendered in HTML
-and don't come back cleanly through the API, or when we need to scrape
-the assignment submission form to fill it in via browser automation.
+Responsibilities
+────────────────
+1. scrape_assignments_list(org_unit_id)
+   Navigate to the Assessments/Assignments tab and return every upcoming
+   dropbox folder with its name, due date, folder ID, and description.
 
-All scraper functions receive a Playwright `page` object and assume the
-browser is already logged in (session restored via storageState).
+2. scrape_course_content(org_unit_id)
+   Navigate to the Course Content tab and return the full topic tree —
+   every module and topic with its title, type, and download URL.
+
+3. find_content_for_assignment(assignment_name, topics)
+   Heuristic matcher: given an assignment name, find the content topic
+   that most likely contains the assignment brief (PDF or DOCX).
+
+4. download_topic_file(org_unit_id, topic_id, save_path)
+   Download a content topic file using the Valence API.
+
+URL patterns (confirmed from D2L docs):
+  Assignments list : /d2l/lms/dropbox/user/folders_list.d2l?ou={ou}
+  Assignment detail: /d2l/lms/dropbox/user/folder_submit_files.d2l?db={db}&ou={ou}
+  Content home     : /d2l/le/content/{ou}/Home
+  API - content TOC: /d2l/api/le/{v}/{ou}/content/toc
+  API - topic file : /d2l/api/le/{v}/{ou}/content/topics/{topicId}/file
 """
 
 import os
+import re
 import time
 from pathlib import Path
+from difflib import SequenceMatcher
+
 from playwright.sync_api import sync_playwright, Page, BrowserContext
+from .session import _BROWSER_DATA_DIR, BASE_URL, get_requests_session
 
-from .session import _BROWSER_DATA_DIR, BASE_URL, ensure_session, _save_state
-
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
+OUTPUT_DIR  = Path(os.getenv("OUTPUT_DIR", "outputs"))
+API_VERSION = "1.82"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Browser context factory
+# Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_context(pw, headless: bool = True) -> BrowserContext:
-    """
-    Returns a persistent Chromium context with the saved browser profile.
-    headless=True for background runs, headless=False for debugging.
-    """
     _BROWSER_DATA_DIR.mkdir(exist_ok=True)
     return pw.chromium.launch_persistent_context(
         user_data_dir=str(_BROWSER_DATA_DIR),
         headless=headless,
-        args=["--start-maximized"],
-        no_viewport=True,
+        slow_mo=50,          # slight delay helps with dynamic D2L pages
     )
 
 
+def _check_session(page: Page, context: BrowserContext):
+    """Raise if we got redirected to a login page."""
+    url = page.url
+    if "login" in url or "microsoftonline" in url or "d2l/auth" in url:
+        context.close()
+        raise RuntimeError(
+            "OnQ session expired. Run `python debug.py` to re-login, "
+            "then try again."
+        )
+
+
+def _similarity(a: str, b: str) -> float:
+    """0–1 string similarity score (case-insensitive)."""
+    return SequenceMatcher(
+        None,
+        a.lower().strip(),
+        b.lower().strip(),
+    ).ratio()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Assignment page scraper
+# 1. Assignments list (Assessments tab)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def scrape_assignment_page(org_unit_id: int, folder_id: int) -> dict:
+def scrape_assignments_list(org_unit_id: int) -> list[dict]:
     """
-    Navigate to the OnQ assignment page and scrape:
-      - Full instructions HTML (sometimes richer than the API returns)
-      - Any linked external URLs in the instructions
-      - Due date (as rendered in the UI)
+    Navigate to the Assessments/Assignments tab for a course and return
+    all visible dropbox folders.
 
-    Returns a dict:
+    Returns a list of dicts:
       {
-        "instructions_html": str,
-        "instructions_text": str,
-        "external_links": [str, ...],
-        "due_date_display": str,
+        "folder_id":    int,
+        "name":         str,
+        "due_date":     str,   # raw text as shown on page
+        "instructions": str,   # text inside the assignment detail page
+        "description":  str,   # short description from list view
+        "status":       str,   # e.g. "No Submissions", "Submitted"
       }
     """
-    url = (
-        f"{BASE_URL}/d2l/lms/dropbox/user/folder_submit_files.d2l"
-        f"?db={folder_id}&grpid=0&isprv=0&bp=0&ou={org_unit_id}"
-    )
+    url = f"{BASE_URL}/d2l/lms/dropbox/user/folders_list.d2l?ou={org_unit_id}"
+    assignments = []
 
     with sync_playwright() as pw:
-        context = _make_context(pw, headless=True)
-        page = context.new_page()
+        context = _make_context(pw)
+        page    = context.new_page()
 
         try:
             page.goto(url, wait_until="networkidle", timeout=30_000)
-            _handle_expired_session(page, context)
+            _check_session(page, context)
 
-            # Extract instructions
-            instructions_html = ""
-            instructions_text = ""
+            # Wait for the assignment table to appear
             try:
-                instr_el = page.locator(
-                    ".d2l-htmleditor-readonly, "
-                    ".d2l-editor, "
-                    "[data-test-id='dropbox-folder-description'], "
-                    ".dco-assignment-description"
-                ).first
-                instr_el.wait_for(timeout=5000)
-                instructions_html = instr_el.inner_html()
-                instructions_text = instr_el.inner_text()
+                page.wait_for_selector(
+                    "table.d2l-table, .d2l-grid, [class*='dropbox']",
+                    timeout=10_000,
+                )
             except Exception:
-                pass
+                pass  # Page may use a different layout
 
-            # Extract due date from UI (more human-readable)
-            due_date_display = ""
-            try:
-                due_el = page.locator(
-                    "[data-test-id='dropbox-due-date'], "
-                    ".d2l-datetime-display, "
-                    ".dco-assignment-due-date"
-                ).first
-                due_date_display = due_el.inner_text(timeout=3000)
-            except Exception:
-                pass
+            # Grab every link that goes to an individual assignment
+            links = page.locator("a[href*='folder_submit_files.d2l']").all()
 
-            # Grab any external links in instructions
-            external_links = []
-            try:
-                links = page.locator(
-                    ".d2l-htmleditor-readonly a, "
-                    ".dco-assignment-description a"
-                ).all()
-                for link in links:
-                    href = link.get_attribute("href")
-                    if href and href.startswith("http"):
-                        external_links.append(href)
-            except Exception:
-                pass
+            for link in links:
+                href  = link.get_attribute("href") or ""
+                name  = link.inner_text().strip()
 
-        finally:
-            context.close()
+                # Extract folder ID from the URL (?db=XXXX)
+                m = re.search(r"[?&]db=(\d+)", href)
+                if not m:
+                    continue
+                folder_id = int(m.group(1))
 
-    return {
-        "instructions_html": instructions_html,
-        "instructions_text": instructions_text,
-        "external_links":    external_links,
-        "due_date_display":  due_date_display,
-    }
-
-
-def _handle_expired_session(page: Page, context: BrowserContext):
-    """
-    If D2L redirected us to the login page, it means the persistent
-    profile session has expired. Re-trigger login and update the state.
-    """
-    current_url = page.url
-    if "login" in current_url or "microsoftonline" in current_url:
-        print("[SCRAPER] Session expired — re-logging in (browser will open)...")
-        from .session import _browser_login
-        # Need headful for MFA
-        context.close()
-        new_cookies = _browser_login()
-        _save_state(new_cookies)
-        raise RuntimeError(
-            "Session expired and was refreshed. Please re-run the pipeline."
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Submission via browser (fallback for File-type assignments)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def submit_via_browser(
-    org_unit_id: int,
-    folder_id: int,
-    answer_text: str,
-    comment: str = "",
-) -> bool:
-    """
-    Uses Playwright to open the OnQ submission form and type in the answer.
-    This is the fallback when the API submission doesn't work.
-
-    Returns True if submission succeeded.
-    """
-    if os.getenv("AUTO_SUBMIT", "false").lower() != "true":
-        raise PermissionError(
-            "AUTO_SUBMIT is disabled. Set AUTO_SUBMIT=true to enable."
-        )
-
-    url = (
-        f"{BASE_URL}/d2l/lms/dropbox/user/folder_submit_files.d2l"
-        f"?db={folder_id}&grpid=0&isprv=0&bp=0&ou={org_unit_id}"
-    )
-
-    with sync_playwright() as pw:
-        context = _make_context(pw, headless=False)  # visible for submission safety
-        page = context.new_page()
-
-        try:
-            page.goto(url, wait_until="networkidle", timeout=30_000)
-            _handle_expired_session(page, context)
-
-            # Click the "Add a File" or text submission tab if present
-            # D2L's text editor is an iframe-based rich text editor (TinyMCE/Brightspace Editor)
-            try:
-                text_tab = page.locator(
-                    "text=Add Text, [data-test-id='text-submission-tab']"
-                ).first
-                text_tab.click(timeout=3000)
-            except Exception:
-                pass  # May already be on text input
-
-            # Find the TinyMCE iframe and type in it
-            frame = page.frame_locator("iframe.tox-edit-area__iframe, iframe[id*='tinymce']").first
-            body  = frame.locator("body")
-            body.click()
-            body.fill(answer_text)
-
-            # Add a comment if the comment field exists
-            if comment:
+                # Find the closest table row to get due date + status
+                row = link.locator("xpath=ancestor::tr").first
+                due_date = ""
+                status   = ""
+                desc     = ""
                 try:
-                    comment_field = page.locator(
-                        "[data-test-id='submission-comment'], "
-                        "textarea[name*='comment'], "
-                        "#d2l_comments"
-                    ).first
-                    comment_field.fill(comment, timeout=3000)
+                    cells = row.locator("td").all()
+                    # D2L column order: Name | Due Date | Submissions | Status
+                    if len(cells) >= 2:
+                        due_date = cells[1].inner_text(timeout=2000).strip()
+                    if len(cells) >= 4:
+                        status = cells[3].inner_text(timeout=2000).strip()
                 except Exception:
                     pass
 
-            # Submit
-            submit_btn = page.locator(
-                "button[type='submit'], "
-                "[data-test-id='submit-button'], "
-                "text=Submit"
-            ).first
-            submit_btn.click()
+                # Fetch detailed instructions from the assignment page
+                instructions = _scrape_assignment_detail(
+                    page, org_unit_id, folder_id
+                )
 
-            # Wait for confirmation
-            page.wait_for_url("**dropbox**", timeout=15_000)
-            time.sleep(2)
-            print("[SCRAPER] Submission completed via browser.")
-            return True
-
-        except Exception as e:
-            print(f"[SCRAPER] Browser submission failed: {e}")
-            return False
+                assignments.append({
+                    "folder_id":    folder_id,
+                    "name":         name,
+                    "due_date":     due_date,
+                    "instructions": instructions,
+                    "description":  desc,
+                    "status":       status,
+                })
 
         finally:
             context.close()
+
+    return assignments
+
+
+def _scrape_assignment_detail(
+    page: Page, org_unit_id: int, folder_id: int
+) -> str:
+    """
+    Open the assignment detail page in the same browser context and
+    extract the full instructions text.
+    """
+    detail_url = (
+        f"{BASE_URL}/d2l/lms/dropbox/user/folder_submit_files.d2l"
+        f"?db={folder_id}&grpid=0&isprv=0&bp=0&ou={org_unit_id}"
+    )
+    try:
+        page.goto(detail_url, wait_until="networkidle", timeout=20_000)
+
+        # Try multiple known selectors for D2L assignment instructions
+        selectors = [
+            ".d2l-htmleditor-readonly",
+            "[data-test-id='dropbox-folder-description']",
+            ".dco-assignment-description",
+            ".d2l-editor",
+            ".d2l-le-scrollable",
+            "d2l-html-block",             # web component used in newer D2L
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                text = el.inner_text(timeout=3000).strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Course content tree (Contents tab)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def scrape_course_content_via_api(org_unit_id: int) -> list[dict]:
+    """
+    Use the D2L Valence REST API to get the full content TOC (Table of
+    Contents) for a course. This is faster and more reliable than scraping
+    the HTML content tree.
+
+    Returns a flat list of topic dicts:
+      {
+        "topic_id":   int,
+        "title":      str,
+        "type":       str,    # "File", "Link", "Video", etc.
+        "url":        str,    # API download URL for file topics
+        "module":     str,    # parent module name
+      }
+    """
+    s = get_requests_session()
+    toc_url = f"{BASE_URL}/d2l/api/le/{API_VERSION}/{org_unit_id}/content/toc"
+
+    try:
+        resp = s.get(toc_url, timeout=15)
+        resp.raise_for_status()
+        toc = resp.json()
+    except Exception as e:
+        print(f"  [CONTENT] API content TOC failed ({e}) — falling back to scraper")
+        return scrape_course_content_via_browser(org_unit_id)
+
+    topics = []
+    _flatten_toc(toc.get("Modules", []), topics, parent_module="")
+    return topics
+
+
+def _flatten_toc(modules: list, out: list, parent_module: str):
+    """Recursively flatten the nested module/topic tree into a list."""
+    for module in modules:
+        mod_name = module.get("Title", "")
+        full_mod = f"{parent_module} > {mod_name}".strip(" >")
+
+        # Topics in this module
+        for topic in module.get("Topics", []):
+            topic_type = topic.get("TypeIdentifier", "")
+            out.append({
+                "topic_id": topic.get("TopicId"),
+                "title":    topic.get("Title", ""),
+                "type":     topic_type,
+                "url":      topic.get("Url", ""),
+                "module":   full_mod,
+            })
+
+        # Recurse into sub-modules
+        _flatten_toc(module.get("Modules", []), out, full_mod)
+
+
+def scrape_course_content_via_browser(org_unit_id: int) -> list[dict]:
+    """
+    Fallback: navigate the Content page with Playwright and extract
+    topic titles + links from the rendered HTML tree.
+    """
+    url = f"{BASE_URL}/d2l/le/content/{org_unit_id}/Home"
+    topics = []
+
+    with sync_playwright() as pw:
+        context = _make_context(pw)
+        page    = context.new_page()
+
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+            _check_session(page, context)
+
+            # Wait for content tree
+            try:
+                page.wait_for_selector(
+                    ".d2l-le-TreeItem, .d2l-datalist-item, [class*='content']",
+                    timeout=10_000,
+                )
+            except Exception:
+                pass
+
+            # Grab all links in the content panel
+            links = page.locator(
+                "a[href*='/content/'], a[href*='/topics/'], a[href*='.pdf'], a[href*='.docx']"
+            ).all()
+
+            for link in links:
+                href  = link.get_attribute("href") or ""
+                title = link.inner_text().strip()
+                if not title:
+                    continue
+
+                # Try to extract topic ID
+                m = re.search(r"/topics?/(\d+)", href)
+                topic_id = int(m.group(1)) if m else None
+
+                # Classify type by extension or URL hint
+                ext = Path(href.split("?")[0]).suffix.lower()
+                if ext == ".pdf":
+                    ftype = "File/PDF"
+                elif ext in (".docx", ".doc"):
+                    ftype = "File/DOCX"
+                elif ext in (".pptx", ".ppt"):
+                    ftype = "File/Presentation"
+                else:
+                    ftype = "Link"
+
+                topics.append({
+                    "topic_id": topic_id,
+                    "title":    title,
+                    "type":     ftype,
+                    "url":      href if href.startswith("http") else BASE_URL + href,
+                    "module":   "",
+                })
+
+        finally:
+            context.close()
+
+    return topics
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Match assignment → content topic
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_content_for_assignment(
+    assignment_name: str,
+    topics: list[dict],
+    threshold: float = 0.45,
+) -> list[dict]:
+    """
+    Given an assignment name, score every content topic by name similarity
+    and return those above the threshold, ranked best-first.
+
+    Also flags topics whose titles contain assignment keywords like
+    "brief", "specification", "instructions", "rubric", "handout".
+
+    Returns: list of topic dicts with an added "score" key.
+    """
+    BRIEF_KEYWORDS = {"brief", "spec", "specification", "instructions",
+                      "rubric", "handout", "description", "outline",
+                      "assignment", "lab", "project", "report"}
+
+    scored = []
+    for topic in topics:
+        # Only consider file-type topics (PDFs, DOCX)
+        ftype = topic.get("type", "").lower()
+        if "file" not in ftype and "pdf" not in ftype and "docx" not in ftype:
+            continue
+
+        title = topic.get("title", "")
+        sim   = _similarity(assignment_name, title)
+
+        # Boost topics whose title contains brief/spec/rubric keywords
+        title_lower = title.lower()
+        if any(kw in title_lower for kw in BRIEF_KEYWORDS):
+            sim = min(sim + 0.2, 1.0)
+
+        # Boost if any word from the assignment name appears in the title
+        assign_words = set(re.findall(r"\w+", assignment_name.lower()))
+        topic_words  = set(re.findall(r"\w+", title_lower))
+        word_overlap  = len(assign_words & topic_words) / max(len(assign_words), 1)
+        sim = min(sim + word_overlap * 0.15, 1.0)
+
+        if sim >= threshold:
+            scored.append({**topic, "score": round(sim, 3)})
+
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Download a content topic file
+# ──────────────────────────────────────────────────────────────────────────────
+
+def download_topic_file(
+    org_unit_id: int,
+    topic_id: int,
+    save_path: str,
+) -> str | None:
+    """
+    Download a content topic's file using the Valence API.
+    Returns the local save path, or None on failure.
+
+    API: GET /d2l/api/le/{v}/{ou}/content/topics/{topicId}/file
+    """
+    s   = get_requests_session()
+    url = (
+        f"{BASE_URL}/d2l/api/le/{API_VERSION}"
+        f"/{org_unit_id}/content/topics/{topic_id}/file"
+    )
+    try:
+        resp = s.get(url, stream=True, timeout=60, allow_redirects=True)
+        resp.raise_for_status()
+
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+        return save_path
+    except Exception as e:
+        print(f"  [CONTENT] Could not download topic {topic_id}: {e}")
+        return None
