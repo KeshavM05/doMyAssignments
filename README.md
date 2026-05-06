@@ -34,7 +34,7 @@
 | **Platform** | D2L Brightspace (branded as **OnQ**) |
 | **Base URL** | `https://onq.queensu.ca` |
 | **API** | D2L Valence REST API v1.82 |
-| **Auth** | OAuth 2.0 Authorization Code Grant |
+| **Auth** | Cookie-based session (Playwright SSO login) |
 | **Language** | Python 3.11+ |
 | **LLMs** | OpenAI / Anthropic / Google (configurable) |
 
@@ -141,6 +141,7 @@ d2l/
 │
 ├── .session_state.json   ← Browser cookies (auto-created, gitignored!)
 ├── .browser_profile/     ← Chromium profile dir (gitignored!)
+│                            (no .tokens.json — OAuth is not used)
 │
 └── outputs/              ← LLM answers (auto-created, gitignored)
     └── {org_unit_id}/
@@ -232,10 +233,6 @@ Copy `.env.example` → `.env` and fill in every value.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ONQ_BASE_URL` | No | `https://onq.queensu.ca` | Base URL of your D2L instance |
-| `D2L_CLIENT_ID` | **Yes** | — | OAuth2 Client ID from registration |
-| `D2L_CLIENT_SECRET` | **Yes** | — | OAuth2 Client Secret |
-| `D2L_REDIRECT_URI` | No | `http://localhost:8080/callback` | Must match registration |
-| `TOKEN_FILE` | No | `.tokens.json` | Where to persist tokens |
 | `LLM_PROVIDER` | **Yes** | `openai` | `openai` \| `anthropic` \| `google` |
 | `OPENAI_API_KEY` | If using OpenAI | — | Your OpenAI key |
 | `OPENAI_MODEL` | No | `gpt-4o` | Model name |
@@ -281,8 +278,8 @@ pytest tests/ -v
 python -m onq_autopilot.pipeline --once
 ```
 
-First run will open a browser window for OAuth login.
-After login, tokens are saved to `.tokens.json` and all active courses are
+First run will open a browser window for you to log in via NetID + MFA.
+After login, session cookies are saved to `.session_state.json` and all active courses are
 scanned for new assignments.
 
 ### Continuous polling
@@ -304,16 +301,6 @@ or set it up as a scheduled task (see below).
 ---
 
 ## 9. Module Reference
-
-### `onq_autopilot/auth.py`
-
-| Function | Description |
-|----------|-------------|
-| `get_valid_tokens()` | Main entry-point. Returns valid tokens, refreshing or re-authorizing as needed. |
-| `authorize()` | Full OAuth browser flow. Blocks until redirect is received. |
-| `refresh_tokens(tokens)` | Exchange refresh token for new access token. |
-| `save_tokens(data)` | Persist token dict to `TOKEN_FILE`. |
-| `load_tokens()` | Read token dict from `TOKEN_FILE`. |
 
 ### `onq_autopilot/d2l_client.py`
 
@@ -474,14 +461,13 @@ def _ollama(prompt: str) -> str:
 
 | Issue | Detail |
 |-------|--------|
-| **OAuth registration** | Queen's IT controls app registration. You may need to use the cookie token hack temporarily. |
+| **Session expiry** | Browser sessions last ~8–20h. Re-login opens the Playwright browser automatically. `.browser_profile/` preserves the Microsoft "remember this device" state so MFA is usually skipped. |
 | **API version** | This code targets v1.82. If OnQ upgrades, check the [deprecation notes](https://docs.valence.desire2learn.com/basic/version.html). |
 | **Group assignments** | `DropboxType=Group` submissions work differently. The pipeline currently only handles individual submissions. |
 | **Quiz/exam detection** | Detection is name-keyword based. It's not foolproof — add more keywords to `SKIP_TYPES`. |
 | **Rate limiting** | 429 responses are not retried. Add `time.sleep` + retry logic if needed. |
 | **File-type submissions** | The pipeline saves the answer as `.md` but doesn't auto-build a `.docx` for file-only assignments. |
 | **LLM accuracy** | The LLM can hallucinate. Always review outputs before submitting. |
-| **Token expiry** | Access tokens expire in 30 min – 20 hours (per registration). Refresh tokens last longer but can also expire. |
 
 ---
 

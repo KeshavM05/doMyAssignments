@@ -27,27 +27,31 @@ d:\d2l\
 
 ---
 
-## Step-by-step setup
+## Step-by-step setup (Windows)
 
-### 1. Create & activate a virtual environment
+### 1. Clone the repo
 
 ```powershell
+git clone <repo-url> d:\d2l
 cd d:\d2l
+```
+
+### 2. Create & activate a virtual environment
+
+```powershell
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-### 2. Install Python dependencies
+### 3. Install Python dependencies and Playwright
 
 ```powershell
-pip install -e .
-```
-
-### 3. Install the Playwright Chromium browser (~150 MB)
-
-```powershell
+pip install -e ".[dev]"
 playwright install chromium
 ```
+
+`.[dev]` installs everything including test/lint tools.
+The `playwright install chromium` step downloads the ~150 MB Chromium browser.
 
 ### 4. Create your `.env` file
 
@@ -55,16 +59,27 @@ playwright install chromium
 copy .env.example .env
 ```
 
-Open `.env` and fill in **at minimum**:
+Open `.env` and fill in **at minimum** the LLM provider and key you want to use.
+Example for OpenAI:
 
 ```env
-LLM_PROVIDER=openai          # or anthropic / google
-OPENAI_API_KEY=sk-...        # your actual key
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+```
+
+Example for Anthropic:
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Everything else has sensible defaults.
 
-### 5. Run the debug script (tests every layer)
+> **Note:** No OAuth setup is required. Authentication is handled automatically
+> by a browser-based cookie session (see Step 5 below).
+
+### 5. Run the debug script to test the connection
 
 ```powershell
 python debug.py
@@ -75,6 +90,9 @@ python debug.py
 - Navigate to OnQ, log in with your NetID + password + MFA
 - The browser closes automatically once you're on the home page
 - The script then tests: cookies → /whoami API → course list → assignment list → headless scraper
+
+Your session cookies are saved to `.session_state.json` (gitignored).
+Subsequent runs reuse them — no browser window unless the session expires.
 
 **Expected output (all green):**
 ```

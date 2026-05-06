@@ -57,3 +57,5 @@ logs/
 # Downloaded assignment files (user data, not source)
 downloads/
 outputs/
+*.pdf
+outputs/**/*.tex

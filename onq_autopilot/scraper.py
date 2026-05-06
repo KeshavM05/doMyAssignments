@@ -30,7 +30,6 @@ URL patterns (confirmed from D2L docs):
 
 import os
 import re
-import time
 from pathlib import Path
 from difflib import SequenceMatcher
 
