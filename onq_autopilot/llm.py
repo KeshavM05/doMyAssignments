@@ -21,7 +21,7 @@ Banned language list (enforced in system prompt):
                 "in the realm of", "as an AI"
 
 Supported providers (set LLM_PROVIDER in .env):
-  openai | anthropic | google
+  openai | anthropic | google | bedrock
 """
 
 import os
@@ -33,6 +33,8 @@ PROVIDER        = os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL",    "gpt-4o")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-5")
 GOOGLE_MODEL    = os.getenv("GOOGLE_MODEL",    "gemini-2.5-pro")
+BEDROCK_MODEL   = os.getenv("BEDROCK_MODEL",   "us.anthropic.claude-sonnet-4-6-20251101-v1:0")
+BEDROCK_REGION  = os.getenv("BEDROCK_REGION",  "us-east-1")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +163,8 @@ def complete(bundle: dict) -> str:
         return _anthropic(prompt)
     elif PROVIDER == "google":
         return _google(prompt)
+    elif PROVIDER == "bedrock":
+        return _bedrock(prompt)
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {PROVIDER!r}")
 
@@ -200,3 +204,18 @@ def _google(user_prompt: str) -> str:
         system_instruction=SYSTEM_PROMPT,
     )
     return model.generate_content(user_prompt).text
+
+
+def _bedrock(user_prompt: str) -> str:
+    import boto3
+    client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+    response = client.converse(
+        modelId=BEDROCK_MODEL,
+        system=[{"text": SYSTEM_PROMPT}],
+        messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+        inferenceConfig={
+            "maxTokens": 8000,
+            "temperature": 0.4,
+        },
+    )
+    return response["output"]["message"]["content"][0]["text"]
