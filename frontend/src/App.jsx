@@ -15,6 +15,10 @@ function formatDate(iso) {
   return d.toLocaleString()
 }
 
+async function safeJson(res) {
+  try { return await res.json() } catch (_) { return null }
+}
+
 // ── Upload Zone ────────────────────────────────────────────────────────────
 
 function UploadZone({ files, setFiles }) {
@@ -200,23 +204,28 @@ export default function App() {
         const formData = new FormData()
         for (const f of files) formData.append('files', f)
         const res = await fetch('/api/upload', { method: 'POST', body: formData })
-        if (!res.ok) throw new Error((await res.json()).detail || 'Upload failed')
-        ;({ job_id } = await res.json())
+        const uploadData = await safeJson(res)
+        if (!res.ok) throw new Error(uploadData?.detail || `Upload failed (${res.status})`)
+        job_id = uploadData.job_id
       } else {
         const res = await fetch('/api/upload-text', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: pasteText, filename: 'pasted_assignment.txt' }),
         })
-        if (!res.ok) throw new Error((await res.json()).detail || 'Text submit failed')
-        ;({ job_id } = await res.json())
+        const uploadData = await safeJson(res)
+        if (!res.ok) throw new Error(uploadData?.detail || `Text submit failed (${res.status})`)
+        job_id = uploadData.job_id
       }
 
       setActiveJobId(job_id)
       setStatusMsg('Generating...')
 
       const genRes = await fetch(`/api/generate/${job_id}`, { method: 'POST' })
-      if (!genRes.ok) throw new Error((await genRes.json()).detail || 'Generation failed')
+      if (!genRes.ok) {
+        const errData = await safeJson(genRes)
+        throw new Error(errData?.detail || `Generation failed (${genRes.status})`)
+      }
 
       const reader = genRes.body.getReader()
       const decoder = new TextDecoder()
