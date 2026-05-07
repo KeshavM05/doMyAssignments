@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
@@ -52,6 +53,11 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 jobs: dict[str, dict] = {}
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
+
+
+class TextInput(BaseModel):
+    text: str
+    filename: str = "pasted_assignment.txt"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -118,6 +124,36 @@ async def upload_files(files: list[UploadFile] = File(...)):
     }
 
     return {"job_id": job_id, "files": saved_files, "status": "pending"}
+
+
+@app.post("/api/upload-text")
+async def upload_text(body: TextInput):
+    """
+    Accept pasted plain text, save it as a .txt file,
+    create a job record, and return the job_id.
+    """
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="Text content is empty")
+
+    job_id = str(uuid.uuid4())
+    job_upload_dir = UPLOADS_DIR / job_id
+    job_upload_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = body.filename if body.filename.endswith(".txt") else body.filename + ".txt"
+    dest = job_upload_dir / filename
+    dest.write_text(body.text, encoding="utf-8")
+
+    jobs[job_id] = {
+        "id":          job_id,
+        "files":       [filename],
+        "status":      "pending",
+        "created_at":  datetime.utcnow().isoformat(),
+        "output_path": None,
+        "error":       None,
+        "_upload_dir": str(job_upload_dir),
+    }
+
+    return {"job_id": job_id, "files": [filename], "status": "pending"}
 
 
 @app.post("/api/generate/{job_id}")
