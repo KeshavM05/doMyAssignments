@@ -1,76 +1,131 @@
 # doMyAssignments
 
-Automates university assignments. Drop files in, get a submission-ready LaTeX document out.
-
-## What it does
-
-1. You put your assignment files (PDF, DOCX, or plain text) into `assignments/`
-2. Run the script
-3. Get a `.tex` file in `outputs/` that matches your personal writing style
-4. Drop it in Overleaf, submit
+Vision-powered university assignment solver. Upload a PDF (or DOCX/TXT), and Claude on AWS Bedrock reads it visually — diagrams, tables, equations and all — then streams back a complete, compilable LaTeX submission.
 
 ## Stack
 
-- **Backend:** Python + boto3 (AWS Bedrock / Claude)
-- **Frontend:** React + FastAPI (Phase 2)
-- **Output:** LaTeX document compiled to PDF
+| Layer    | Tech                              |
+|----------|-----------------------------------|
+| Backend  | FastAPI + uvicorn                 |
+| LLM      | AWS Bedrock (`converse_stream`)   |
+| PDF      | `pdf2image` (poppler) — vision    |
+| Frontend | React 18 + Vite + Monaco Editor   |
 
-## Project Structure
+---
+
+## Quick Start
+
+### 1. AWS credentials
+
+Make sure your AWS credentials are configured (the usual `~/.aws/credentials` or environment variables). The IAM role/user needs `bedrock:InvokeModel` on the model you've configured.
+
+### 2. Environment
+
+```bash
+cp .env.example .env
+# Edit .env if you need a different model or region
+```
+
+### 3. Backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload
+# → http://localhost:8000
+```
+
+> **Poppler required** for PDF vision processing:
+> - macOS: `brew install poppler`
+> - Ubuntu/Debian: `sudo apt-get install poppler-utils`
+> - Windows: download from https://github.com/oschwartz10612/poppler-windows/releases
+
+### 4. Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+# → http://localhost:5173
+```
+
+The Vite dev server proxies `/api` to `http://localhost:8000` automatically.
+
+---
+
+## API Reference
+
+| Method | Path                     | Description                                    |
+|--------|--------------------------|------------------------------------------------|
+| POST   | `/api/upload`            | Upload files → returns `job_id`                |
+| POST   | `/api/generate/{job_id}` | Stream LaTeX output as SSE                     |
+| GET    | `/api/jobs`              | List all jobs                                  |
+| GET    | `/api/jobs/{job_id}`     | Get single job status                          |
+| GET    | `/api/output/{job_id}`   | Download the generated `.tex` file             |
+| GET    | `/api/health`            | Health check                                   |
+
+### SSE stream format
+
+```
+data: <latex chunk>\n\n
+...
+data: [DONE]\n\n
+```
+
+On error:
+```
+data: [ERROR] <message>\n\n
+```
+
+---
+
+## Supported file types
+
+| Extension | Processing method                        |
+|-----------|------------------------------------------|
+| `.pdf`    | Vision — pages rendered as PNG images   |
+| `.docx`   | Text extraction via `python-docx`        |
+| `.txt`    | Direct read                              |
+| `.md`     | Direct read                              |
+
+---
+
+## Directory layout
 
 ```
 doMyAssignments/
-├── assignments/        ← drop your assignment files here
-├── outputs/            ← generated .tex files land here
+├── backend/
+│   ├── main.py          # FastAPI app + all endpoints
+│   ├── generate.py      # LLM logic, file processing, Bedrock streaming
+│   ├── requirements.txt
+│   └── uploads/         # Uploaded files (gitignored)
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx      # Single-page app
+│   │   ├── App.css      # Dark theme styles
+│   │   └── main.jsx     # Entry point
+│   ├── index.html
+│   ├── package.json
+│   └── vite.config.js   # Dev server + /api proxy
 ├── style/
-│   ├── STYLE.md        ← writing style rules (your voice)
-│   └── TEMPLATE.tex    ← base LaTeX template
-├── src/
-│   └── generate.py     ← core script (Phase 1)
+│   ├── STYLE.md         # Writing style guide
+│   └── TEMPLATE.tex     # LaTeX template reference
+├── outputs/             # Generated .tex files (gitignored)
+├── assignments/         # Input files (gitignored)
 ├── .env.example
 ├── .gitignore
 └── README.md
 ```
 
-## Setup
+---
 
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # configure AWS region
-```
+## Notes
 
-AWS credentials must be configured (`aws configure` or existing `~/.aws/credentials`).
+- **No database** — jobs are stored in memory. Restart the backend and history clears.
+- **Vision model** — PDFs are sent as images so Claude can see figures, diagrams, hand-drawn tables, etc.
+- The generated `.tex` files land in `outputs/` and are downloadable via the UI or `/api/output/{job_id}`.
+- Drop the `.tex` into [Overleaf](https://overleaf.com) to compile.
 
-## Usage (Phase 1 — CLI)
+---
 
-```bash
-# Drop assignment files into assignments/
-python src/generate.py
-
-# Or point at a specific file
-python src/generate.py assignments/elec372_a7.pdf
-```
-
-Output saved to `outputs/YYYY-MM-DD_HH-MM_<filename>.tex`
-
-## Roadmap
-
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 1 | 🔨 Building | Core script — file in, `.tex` out |
-| 2 | 📋 Planned | FastAPI backend + React frontend |
-| 3 | 📋 Planned | Live LaTeX preview (Overleaf-style) |
-| 4 | 📋 Planned | Drag & drop UI, inline editing, PDF download |
-| 5 | 📋 Planned | D2L/OnQ scraping (auto-fetch assignments) |
-
-## Output Style
-
-Every generated document follows Keshav's personal style:
-- Cover page with course, assignment number, name, student ID
-- Clean section/subsection structure
-- `booktabs` tables, proper math environments
-- No semicolons, no em dashes, no AI filler phrases
-- Concise and direct — answers what's asked, nothing more
-
-See `style/STYLE.md` for the full style guide.
+*Keshav Mehndiratta · Student ID: 20416565*

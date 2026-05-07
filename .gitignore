@@ -54,8 +54,21 @@ Thumbs.db
 logs/
 *.log
 
-# Downloaded assignment files (user data, not source)
-downloads/
+# User data (not source)
 outputs/
-*.pdf
-outputs/**/*.tex
+assignments/
+backend/uploads/
+downloads/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.log
+*.fls
+*.fdb_latexmk
+*.synctex.gz
